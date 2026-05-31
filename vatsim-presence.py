@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-VATSIM Discord Rich Presence — with GUI
+VATSIM Discord Rich Presence — with GUI + system tray
 """
 
 import re
-import sys
+import io
 import time
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 import requests
 from pypresence import Presence
+from PIL import Image, ImageDraw
+import pystray
 
 # ── Config ────────────────────────────────────────────────────────────────────
 POLL_SECONDS = 30
 VATSIM_URL   = "https://data.vatsim.net/v3/vatsim-data.json"
-
-# you need an actual discord client ID
-CLIENT_ID = ""
+CLIENT_ID    = "you need an actual discord client ID, google it"
 
 
 # ── VATSIM ────────────────────────────────────────────────────────────────────
@@ -30,8 +30,7 @@ def fetch_pilot_by_cid(cid: str) -> dict | None:
 
 def clean_aircraft(raw: str) -> str:
     raw = re.sub(r"^[A-Z]/", "", raw)
-    raw = raw.split("/")[0]
-    return raw.strip()
+    return raw.split("/")[0].strip()
 
 
 def parse_registration(remarks: str) -> str | None:
@@ -63,21 +62,33 @@ def flight_phase(gs: int, alt: int) -> str:
     return                             "Descending"
 
 
+# ── Tray icon (simple green circle) ──────────────────────────────────────────
+def make_tray_icon():
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([8, 8, 56, 56], fill="#3b82f6")
+    draw.polygon([(24, 18), (48, 32), (24, 46)], fill="white")  # play-ish arrow
+    return img
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 class App:
     def __init__(self, root):
-        self.root  = root
-        self.rpc   = None
-        self.running   = False
+        self.root        = root
+        self.rpc         = None
+        self.running     = False
         self.poll_thread = None
+        self.tray        = None
+        self.vatsim_start_time = None  # when pilot first found on network
 
         root.title("VATSIM Rich Presence")
         root.resizable(False, False)
         root.configure(padx=20, pady=20)
+        root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
         # ── CID row ──
         tk.Label(root, text="VATSIM CID", font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w")
-        self.cid_var = tk.StringVar()
+        self.cid_var   = tk.StringVar()
         self.cid_entry = tk.Entry(root, textvariable=self.cid_var, width=20, font=("Segoe UI", 11))
         self.cid_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 12))
 
@@ -94,12 +105,44 @@ class App:
                                    relief="flat", padx=8, pady=6)
         self.status_text.grid(row=4, column=0, columnspan=2)
 
-    def log(self, msg: str):
-        self.status_text.configure(state="normal")
-        self.status_text.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
-        self.status_text.see("end")
-        self.status_text.configure(state="disabled")
+        # ── Tray hint ──
+        tk.Label(root, text="Closing the window minimises to tray",
+                 font=("Segoe UI", 8), fg="gray").grid(row=5, column=0, columnspan=2, pady=(8, 0))
 
+        # Start tray icon immediately (hidden until minimised)
+        self._start_tray()
+
+    # ── Logging ──────────────────────────────────────────────────────────────
+    def log(self, msg: str):
+        def _write():
+            self.status_text.configure(state="normal")
+            self.status_text.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
+            self.status_text.see("end")
+            self.status_text.configure(state="disabled")
+        self.root.after(0, _write)
+
+    # ── Tray ─────────────────────────────────────────────────────────────────
+    def _start_tray(self):
+        menu = pystray.Menu(
+            pystray.MenuItem("Show", self.show_from_tray, default=True),
+            pystray.MenuItem("Quit", self.quit_app),
+        )
+        self.tray = pystray.Icon("VATSIM RPC", make_tray_icon(), "VATSIM Rich Presence", menu)
+        threading.Thread(target=self.tray.run, daemon=True).start()
+
+    def hide_to_tray(self):
+        self.root.withdraw()
+
+    def show_from_tray(self, icon=None, item=None):
+        self.root.after(0, self.root.deiconify)
+
+    def quit_app(self, icon=None, item=None):
+        self.stop()
+        if self.tray:
+            self.tray.stop()
+        self.root.after(0, self.root.destroy)
+
+    # ── Start / Stop ─────────────────────────────────────────────────────────
     def start(self):
         cid = self.cid_var.get().strip()
         if not cid.isdigit():
@@ -117,6 +160,7 @@ class App:
             return
 
         self.running = True
+        self.vatsim_start_time = None
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.cid_entry.configure(state="disabled")
@@ -127,6 +171,7 @@ class App:
 
     def stop(self):
         self.running = False
+        self.vatsim_start_time = None
         if self.rpc:
             try:
                 self.rpc.clear()
@@ -134,17 +179,20 @@ class App:
             except Exception:
                 pass
             self.rpc = None
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        self.cid_entry.configure(state="normal")
+        self.root.after(0, lambda: self.start_btn.configure(state="normal"))
+        self.root.after(0, lambda: self.stop_btn.configure(state="disabled"))
+        self.root.after(0, lambda: self.cid_entry.configure(state="normal"))
         self.log("Stopped.")
 
+    # ── Poll loop ─────────────────────────────────────────────────────────────
     def poll_loop(self, cid: str):
         while self.running:
             try:
                 pilot = fetch_pilot_by_cid(cid)
 
                 if pilot is None:
+                    # Reset timer when they drop off the network
+                    self.vatsim_start_time = None
                     self.log(f"CID {cid} not found on network")
                     self.rpc.update(
                         details=f"CID {cid} — Offline",
@@ -153,6 +201,10 @@ class App:
                         large_text="VATSIM",
                     )
                 else:
+                    # Start timer the first time we see them online
+                    if self.vatsim_start_time is None:
+                        self.vatsim_start_time = int(time.time())
+
                     f      = parse_flight(pilot)
                     phase  = flight_phase(f["groundspeed"], f["altitude"])
                     reg    = f" · {f['registration']}" if f["registration"] else ""
@@ -169,11 +221,11 @@ class App:
                         large_text=large_text,
                         small_image=phase.lower().replace(" ", "_"),
                         small_text=phase,
-                        start=int(time.time()),
+                        start=self.vatsim_start_time,  # ← time on VATSIM, not app start
                         buttons=[{"label": "View on VATSIM",
                                   "url": f"https://map.vatsim.net/?callsign={f['callsign']}"}],
                     )
-                    self.log(f"{details}")
+                    self.log(details)
                     self.log(f"  {state}")
 
             except requests.RequestException as e:
